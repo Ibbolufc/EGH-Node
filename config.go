@@ -11,7 +11,9 @@ type Config struct {
 	Debug  bool   `yaml:"debug"`
 	Remote string `yaml:"remote"`
 	Token  string `yaml:"token"`
-	API    struct {
+	NodeID int    `yaml:"node_id"`
+
+	API struct {
 		Host string `yaml:"host"`
 		Port int    `yaml:"port"`
 		SSL  struct {
@@ -19,12 +21,14 @@ type Config struct {
 		} `yaml:"ssl"`
 		UploadLimit int `yaml:"upload_limit"`
 	} `yaml:"api"`
+
 	System struct {
 		Data string `yaml:"data"`
 		SFTP struct {
 			BindPort int `yaml:"bind_port"`
 		} `yaml:"sftp"`
 	} `yaml:"system"`
+
 	AllowedOrigins []string `yaml:"allowed_origins"`
 }
 
@@ -44,6 +48,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.Token == "" {
 		return nil, fmt.Errorf("config missing token")
+	}
+	if cfg.NodeID <= 0 {
+		return nil, fmt.Errorf("config missing valid node_id")
 	}
 	if cfg.API.Host == "" {
 		cfg.API.Host = "0.0.0.0"
