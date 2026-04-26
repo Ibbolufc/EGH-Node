@@ -10,7 +10,6 @@ import (
 
 func main() {
 	configPath := flag.String("config", "/etc/egh-node/config.yml", "Path to config file")
-	nodeID := flag.String("node-id", "", "Node ID for heartbeat registration")
 	flag.Parse()
 
 	cfg, err := LoadConfig(*configPath)
@@ -29,12 +28,9 @@ func main() {
 
 	log.Printf("starting egh-node on %s", addr)
 	log.Printf("remote panel: %s", cfg.Remote)
+	log.Printf("node id: %d", cfg.NodeID)
 
-	if *nodeID != "" {
-		go heartbeatLoop(cfg, *nodeID)
-	} else {
-		log.Println("node-id not supplied, heartbeat loop not started")
-	}
+	go heartbeatLoop(cfg, fmt.Sprintf("%d", cfg.NodeID))
 
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Printf("server stopped: %v", err)
