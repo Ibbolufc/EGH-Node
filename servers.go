@@ -8,7 +8,9 @@ import (
     "errors"
     "fmt"
     "io"
+    "io/fs"
     "log"
+    "mime"
     "net/http"
     "os"
     "path/filepath"
@@ -32,6 +34,17 @@ type daemonServerRecord struct {
     State          string            `json:"state"`
     CreatedAt      time.Time         `json:"created_at"`
     UpdatedAt      time.Time         `json:"updated_at"`
+}
+
+type daemonFileEntry struct {
+    Name       string `json:"name"`
+    Size       int64  `json:"size"`
+    IsFile     bool   `json:"is_file"`
+    IsSymlink  bool   `json:"is_symlink"`
+    IsEditable bool   `json:"is_editable"`
+    MimeType   string `json:"mime_type"`
+    CreatedAt  string `json:"created_at"`
+    ModifiedAt string `json:"modified_at"`
 }
 
 type provisionRequest struct {
@@ -63,6 +76,24 @@ type powerRequest struct {
 
 type commandRequest struct {
     Command string `json:"command"`
+}
+
+type deleteFilesRequest struct {
+    Root  string   `json:"root"`
+    Files []string `json:"files"`
+}
+
+type renameFilesRequest struct {
+    Root  string `json:"root"`
+    Files []struct {
+        From string `json:"from"`
+        To   string `json:"to"`
+    } `json:"files"`
+}
+
+type createDirectoryRequest struct {
+    Root string `json:"root"`
+    Name string `json:"name"`
 }
 
 type resourceResponse struct {
@@ -126,6 +157,18 @@ func serverRouter(cfg *Config) http.HandlerFunc {
             handleSendCommand(cfg, uuid, w, r)
         case len(parts) == 2 && parts[1] == "ws" && r.Method == http.MethodGet:
             handleServerWebSocket(cfg, uuid, w, r)
+        case len(parts) == 3 && parts[1] == "files" && parts[2] == "list" && r.Method == http.MethodGet:
+            handleListFiles(cfg, uuid, w, r)
+        case len(parts) == 3 && parts[1] == "files" && parts[2] == "contents" && r.Method == http.MethodGet:
+            handleReadFile(cfg, uuid, w, r)
+        case len(parts) == 3 && parts[1] == "files" && parts[2] == "write" && r.Method == http.MethodPost:
+            handleWriteFile(cfg, uuid, w, r)
+        case len(parts) == 3 && parts[1] == "files" && parts[2] == "delete" && r.Method == http.MethodPost:
+            handleDeleteFiles(cfg, uuid, w, r)
+        case len(parts) == 3 && parts[1] == "files" && parts[2] == "rename" && r.Method == http.MethodPut:
+            handleRenameFiles(cfg, uuid, w, r)
+        case len(parts) == 3 && parts[1] == "files" && parts[2] == "create-directory" && r.Method == http.MethodPost:
+            handleCreateDirectory(cfg, uuid, w, r)
         default:
             http.NotFound(w, r)
         }
@@ -160,6 +203,10 @@ func handleProvisionServer(cfg *Config, uuid string, w http.ResponseWriter, r *h
 
     if err := saveServerRecord(cfg, record); err != nil {
         http.Error(w, fmt.Sprintf("failed to persist server: %v", err), http.StatusInternalServerError)
+        return
+    }
+    if err := os.MkdirAll(serverFSRoot(cfg, uuid), 0o755); err != nil {
+        http.Error(w, fmt.Sprintf("failed to create server filesystem: %v", err), http.StatusInternalServerError)
         return
     }
 
@@ -265,7 +312,7 @@ func handleGetResources(cfg *Config, uuid string, w http.ResponseWriter, r *http
     resp.CurrentState = record.State
     resp.Resources.CPUAbsolute = 0
     resp.Resources.MemoryBytes = 0
-    resp.Resources.DiskBytes = 0
+    resp.Resources.DiskBytes = directorySize(serverFSRoot(cfg, uuid))
     resp.Resources.NetworkRxBytes = 0
     resp.Resources.NetworkTxBytes = 0
     resp.Resources.Uptime = 0
@@ -293,6 +340,165 @@ func handleSendCommand(cfg *Config, uuid string, w http.ResponseWriter, r *http.
     }
 
     log.Printf("server command received uuid=%s state=%s command=%q", uuid, record.State, req.Command)
+    w.WriteHeader(http.StatusNoContent)
+}
+
+func handleListFiles(cfg *Config, uuid string, w http.ResponseWriter, r *http.Request) {
+    dir := r.URL.Query().Get("directory")
+    resolved, err := resolveServerPath(cfg, uuid, dir)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+
+    entries, err := os.ReadDir(resolved)
+    if err != nil {
+        http.Error(w, fmt.Sprintf("failed to read directory: %v", err), http.StatusInternalServerError)
+        return
+    }
+
+    files := make([]daemonFileEntry, 0, len(entries))
+    for _, entry := range entries {
+        info, statErr := entry.Info()
+        if statErr != nil {
+            continue
+        }
+        mimeType := "inode/directory"
+        if !entry.IsDir() {
+            ext := filepath.Ext(entry.Name())
+            mimeType = mime.TypeByExtension(ext)
+            if mimeType == "" {
+                mimeType = "text/plain"
+            }
+        }
+        files = append(files, daemonFileEntry{
+            Name:       entry.Name(),
+            Size:       info.Size(),
+            IsFile:     !entry.IsDir(),
+            IsSymlink:  info.Mode()&os.ModeSymlink != 0,
+            IsEditable: !entry.IsDir(),
+            MimeType:   mimeType,
+            CreatedAt:  info.ModTime().UTC().Format(time.RFC3339),
+            ModifiedAt: info.ModTime().UTC().Format(time.RFC3339),
+        })
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    _ = json.NewEncoder(w).Encode(map[string]any{"files": files})
+}
+
+func handleReadFile(cfg *Config, uuid string, w http.ResponseWriter, r *http.Request) {
+    fileParam := r.URL.Query().Get("file")
+    resolved, err := resolveServerPath(cfg, uuid, fileParam)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+
+    data, err := os.ReadFile(resolved)
+    if err != nil {
+        http.Error(w, fmt.Sprintf("failed to read file: %v", err), http.StatusInternalServerError)
+        return
+    }
+
+    w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+    _, _ = w.Write(data)
+}
+
+func handleWriteFile(cfg *Config, uuid string, w http.ResponseWriter, r *http.Request) {
+    fileParam := r.URL.Query().Get("file")
+    resolved, err := resolveServerPath(cfg, uuid, fileParam)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+
+    if err := os.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
+        http.Error(w, fmt.Sprintf("failed to create parent directory: %v", err), http.StatusInternalServerError)
+        return
+    }
+    body, err := io.ReadAll(r.Body)
+    if err != nil {
+        http.Error(w, fmt.Sprintf("failed to read request body: %v", err), http.StatusBadRequest)
+        return
+    }
+    if err := os.WriteFile(resolved, body, 0o644); err != nil {
+        http.Error(w, fmt.Sprintf("failed to write file: %v", err), http.StatusInternalServerError)
+        return
+    }
+    log.Printf("server file written uuid=%s path=%s", uuid, fileParam)
+    w.WriteHeader(http.StatusNoContent)
+}
+
+func handleDeleteFiles(cfg *Config, uuid string, w http.ResponseWriter, r *http.Request) {
+    var req deleteFilesRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, fmt.Sprintf("invalid delete payload: %v", err), http.StatusBadRequest)
+        return
+    }
+    for _, file := range req.Files {
+        combined := filepath.ToSlash(filepath.Join(req.Root, file))
+        resolved, err := resolveServerPath(cfg, uuid, combined)
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusBadRequest)
+            return
+        }
+        if err := os.RemoveAll(resolved); err != nil {
+            http.Error(w, fmt.Sprintf("failed to delete %s: %v", file, err), http.StatusInternalServerError)
+            return
+        }
+    }
+    log.Printf("server files deleted uuid=%s count=%d", uuid, len(req.Files))
+    w.WriteHeader(http.StatusNoContent)
+}
+
+func handleRenameFiles(cfg *Config, uuid string, w http.ResponseWriter, r *http.Request) {
+    var req renameFilesRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, fmt.Sprintf("invalid rename payload: %v", err), http.StatusBadRequest)
+        return
+    }
+    for _, file := range req.Files {
+        fromResolved, err := resolveServerPath(cfg, uuid, filepath.ToSlash(filepath.Join(req.Root, file.From)))
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusBadRequest)
+            return
+        }
+        toResolved, err := resolveServerPath(cfg, uuid, filepath.ToSlash(filepath.Join(req.Root, file.To)))
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusBadRequest)
+            return
+        }
+        if err := os.MkdirAll(filepath.Dir(toResolved), 0o755); err != nil {
+            http.Error(w, fmt.Sprintf("failed to create target directory: %v", err), http.StatusInternalServerError)
+            return
+        }
+        if err := os.Rename(fromResolved, toResolved); err != nil {
+            http.Error(w, fmt.Sprintf("failed to rename file: %v", err), http.StatusInternalServerError)
+            return
+        }
+    }
+    log.Printf("server files renamed uuid=%s count=%d", uuid, len(req.Files))
+    w.WriteHeader(http.StatusNoContent)
+}
+
+func handleCreateDirectory(cfg *Config, uuid string, w http.ResponseWriter, r *http.Request) {
+    var req createDirectoryRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, fmt.Sprintf("invalid create-directory payload: %v", err), http.StatusBadRequest)
+        return
+    }
+    target := filepath.ToSlash(filepath.Join(req.Root, req.Name))
+    resolved, err := resolveServerPath(cfg, uuid, target)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+    if err := os.MkdirAll(resolved, 0o755); err != nil {
+        http.Error(w, fmt.Sprintf("failed to create directory: %v", err), http.StatusInternalServerError)
+        return
+    }
+    log.Printf("server directory created uuid=%s path=%s", uuid, target)
     w.WriteHeader(http.StatusNoContent)
 }
 
@@ -387,10 +593,10 @@ func handleServerWebSocket(cfg *Config, uuid string, w http.ResponseWriter, r *h
                 return
             }
             payload, _ := json.Marshal(map[string]any{
-                "cpu_absolute":      0,
-                "memory_bytes":      0,
+                "cpu_absolute":       0,
+                "memory_bytes":       0,
                 "memory_limit_bytes": int64(current.MemoryLimit) * 1024 * 1024,
-                "disk_bytes":        0,
+                "disk_bytes":         directorySize(serverFSRoot(cfg, uuid)),
                 "network": map[string]any{
                     "rx_bytes": 0,
                     "tx_bytes": 0,
@@ -416,6 +622,7 @@ func handleDeleteServer(cfg *Config, uuid string, w http.ResponseWriter, r *http
         http.Error(w, fmt.Sprintf("failed to delete server: %v", err), http.StatusInternalServerError)
         return
     }
+    _ = os.RemoveAll(serverFSRoot(cfg, uuid))
     _ = os.Remove(serverRecordDir(cfg, uuid))
     log.Printf("server deleted uuid=%s", uuid)
     w.WriteHeader(http.StatusNoContent)
@@ -508,6 +715,47 @@ func serverRecordDir(cfg *Config, uuid string) string {
 
 func serverRecordPath(cfg *Config, uuid string) string {
     return filepath.Join(serverRecordDir(cfg, uuid), "server.json")
+}
+
+func serverFSRoot(cfg *Config, uuid string) string {
+    return filepath.Join(serverRecordDir(cfg, uuid), "fs")
+}
+
+func resolveServerPath(cfg *Config, uuid string, unsafePath string) (string, error) {
+    root := serverFSRoot(cfg, uuid)
+    if err := os.MkdirAll(root, 0o755); err != nil {
+        return "", fmt.Errorf("failed to prepare server filesystem: %w", err)
+    }
+    cleaned := strings.TrimSpace(unsafePath)
+    if cleaned == "" || cleaned == "/" {
+        return root, nil
+    }
+    cleaned = filepath.ToSlash(filepath.Clean("/" + cleaned))
+    rel := strings.TrimPrefix(cleaned, "/")
+    resolved := filepath.Join(root, rel)
+    relative, err := filepath.Rel(root, resolved)
+    if err != nil {
+        return "", fmt.Errorf("invalid path")
+    }
+    if relative == ".." || strings.HasPrefix(relative, fmt.Sprintf("..%c", os.PathSeparator)) {
+        return "", fmt.Errorf("path escapes server filesystem")
+    }
+    return resolved, nil
+}
+
+func directorySize(root string) int64 {
+    var total int64
+    _ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+        if err != nil || d == nil || d.IsDir() {
+            return nil
+        }
+        info, statErr := d.Info()
+        if statErr == nil {
+            total += info.Size()
+        }
+        return nil
+    })
+    return total
 }
 
 func coalesceEnv(primary map[string]string, fallback map[string]string) map[string]string {
