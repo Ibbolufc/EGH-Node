@@ -16,6 +16,7 @@ import (
     "time"
 
     jwt "github.com/golang-jwt/jwt/v5"
+    "github.com/gorilla/websocket"
 )
 
 type daemonServerRecord struct {
@@ -81,6 +82,15 @@ type installCallbackBody struct {
     Reinstall  bool `json:"reinstall"`
 }
 
+type daemonWsEnvelope struct {
+    Event string   `json:"event"`
+    Args  []string `json:"args"`
+}
+
+var daemonUpgrader = websocket.Upgrader{
+    CheckOrigin: func(r *http.Request) bool { return true },
+}
+
 func registerServerRoutes(mux *http.ServeMux, cfg *Config) {
     _ = os.MkdirAll(filepath.Join(cfg.System.Data, "servers"), 0o755)
     mux.HandleFunc("/api/servers/", requireDaemonAuth(cfg, serverRouter(cfg)))
@@ -114,6 +124,8 @@ func serverRouter(cfg *Config) http.HandlerFunc {
             handleGetResources(cfg, uuid, w, r)
         case len(parts) == 2 && parts[1] == "commands" && r.Method == http.MethodPost:
             handleSendCommand(cfg, uuid, w, r)
+        case len(parts) == 2 && parts[1] == "ws" && r.Method == http.MethodGet:
+            handleServerWebSocket(cfg, uuid, w, r)
         default:
             http.NotFound(w, r)
         }
@@ -282,6 +294,120 @@ func handleSendCommand(cfg *Config, uuid string, w http.ResponseWriter, r *http.
 
     log.Printf("server command received uuid=%s state=%s command=%q", uuid, record.State, req.Command)
     w.WriteHeader(http.StatusNoContent)
+}
+
+func handleServerWebSocket(cfg *Config, uuid string, w http.ResponseWriter, r *http.Request) {
+    record, err := loadServerRecord(cfg, uuid)
+    if err != nil {
+        if errors.Is(err, os.ErrNotExist) {
+            http.Error(w, "server not found", http.StatusNotFound)
+            return
+        }
+        http.Error(w, fmt.Sprintf("failed to load server: %v", err), http.StatusInternalServerError)
+        return
+    }
+
+    conn, err := daemonUpgrader.Upgrade(w, r, nil)
+    if err != nil {
+        log.Printf("server ws upgrade failed uuid=%s: %v", uuid, err)
+        return
+    }
+    defer conn.Close()
+
+    log.Printf("server websocket connected uuid=%s", uuid)
+    _ = conn.WriteJSON(daemonWsEnvelope{Event: "auth success", Args: []string{}})
+    _ = conn.WriteJSON(daemonWsEnvelope{Event: "status", Args: []string{record.State}})
+    _ = conn.WriteJSON(daemonWsEnvelope{Event: "console output", Args: []string{fmt.Sprintf("[EGH Node] Connected to server %s", uuid)}})
+
+    ticker := time.NewTicker(5 * time.Second)
+    defer ticker.Stop()
+
+    done := make(chan struct{})
+
+    go func() {
+        defer close(done)
+        for {
+            var msg daemonWsEnvelope
+            if err := conn.ReadJSON(&msg); err != nil {
+                if !websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+                    log.Printf("server websocket read failed uuid=%s: %v", uuid, err)
+                }
+                return
+            }
+
+            current, loadErr := loadServerRecord(cfg, uuid)
+            if loadErr != nil {
+                log.Printf("server websocket load failed uuid=%s: %v", uuid, loadErr)
+                return
+            }
+
+            switch msg.Event {
+            case "send command":
+                command := ""
+                if len(msg.Args) > 0 {
+                    command = msg.Args[0]
+                }
+                log.Printf("server websocket command uuid=%s command=%q", uuid, command)
+                _ = conn.WriteJSON(daemonWsEnvelope{Event: "console output", Args: []string{fmt.Sprintf("> %s", command)}})
+            case "set state":
+                if len(msg.Args) == 0 {
+                    continue
+                }
+                action := msg.Args[0]
+                switch action {
+                case "start", "restart":
+                    current.State = "running"
+                case "stop", "kill":
+                    current.State = "offline"
+                default:
+                    _ = conn.WriteJSON(daemonWsEnvelope{Event: "console output", Args: []string{fmt.Sprintf("[EGH Node] Unknown state action: %s", action)}})
+                    continue
+                }
+                current.UpdatedAt = time.Now().UTC()
+                if err := saveServerRecord(cfg, current); err != nil {
+                    log.Printf("server websocket save failed uuid=%s: %v", uuid, err)
+                    continue
+                }
+                log.Printf("server websocket state uuid=%s action=%s state=%s", uuid, action, current.State)
+                _ = conn.WriteJSON(daemonWsEnvelope{Event: "status", Args: []string{current.State}})
+                _ = conn.WriteJSON(daemonWsEnvelope{Event: "console output", Args: []string{fmt.Sprintf("[EGH Node] State changed to %s", current.State)}})
+            }
+        }
+    }()
+
+    for {
+        select {
+        case <-done:
+            log.Printf("server websocket disconnected uuid=%s", uuid)
+            return
+        case <-ticker.C:
+            current, loadErr := loadServerRecord(cfg, uuid)
+            if loadErr != nil {
+                log.Printf("server websocket ticker load failed uuid=%s: %v", uuid, loadErr)
+                return
+            }
+            payload, _ := json.Marshal(map[string]any{
+                "cpu_absolute":      0,
+                "memory_bytes":      0,
+                "memory_limit_bytes": int64(current.MemoryLimit) * 1024 * 1024,
+                "disk_bytes":        0,
+                "network": map[string]any{
+                    "rx_bytes": 0,
+                    "tx_bytes": 0,
+                },
+                "uptime": 0,
+                "state":  current.State,
+            })
+            if err := conn.WriteJSON(daemonWsEnvelope{Event: "stats", Args: []string{string(payload)}}); err != nil {
+                log.Printf("server websocket stats write failed uuid=%s: %v", uuid, err)
+                return
+            }
+            if err := conn.WriteJSON(daemonWsEnvelope{Event: "status", Args: []string{current.State}}); err != nil {
+                log.Printf("server websocket status write failed uuid=%s: %v", uuid, err)
+                return
+            }
+        }
+    }
 }
 
 func handleDeleteServer(cfg *Config, uuid string, w http.ResponseWriter, r *http.Request) {
