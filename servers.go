@@ -44,7 +44,7 @@ type provisionRequest struct {
             CPULimit    int `json:"cpu_limit"`
         } `json:"build"`
         Container struct {
-            Image string `json:"image"`
+            Image string            `json:"image"`
             Env   map[string]string `json:"env"`
         } `json:"container"`
         Allocations struct {
@@ -58,6 +58,10 @@ type provisionRequest struct {
 
 type powerRequest struct {
     Action string `json:"action"`
+}
+
+type commandRequest struct {
+    Command string `json:"command"`
 }
 
 type resourceResponse struct {
@@ -108,6 +112,8 @@ func serverRouter(cfg *Config) http.HandlerFunc {
             handlePowerAction(cfg, uuid, w, r)
         case len(parts) == 2 && parts[1] == "resources" && r.Method == http.MethodGet:
             handleGetResources(cfg, uuid, w, r)
+        case len(parts) == 2 && parts[1] == "commands" && r.Method == http.MethodPost:
+            handleSendCommand(cfg, uuid, w, r)
         default:
             http.NotFound(w, r)
         }
@@ -145,6 +151,7 @@ func handleProvisionServer(cfg *Config, uuid string, w http.ResponseWriter, r *h
         return
     }
 
+    log.Printf("server provisioned uuid=%s image=%s memory=%dMB disk=%dMB cpu=%d%% alloc=%s:%d", record.UUID, record.Image, record.MemoryLimit, record.DiskLimit, record.CPULimit, record.AllocationIP, record.AllocationPort)
     w.WriteHeader(http.StatusNoContent)
 }
 
@@ -166,6 +173,7 @@ func handleInstallServer(cfg *Config, uuid string, w http.ResponseWriter, r *htt
         return
     }
 
+    log.Printf("server install requested uuid=%s", uuid)
     go completeInstallAsync(cfg, uuid)
     w.WriteHeader(http.StatusNoContent)
 }
@@ -226,6 +234,7 @@ func handlePowerAction(cfg *Config, uuid string, w http.ResponseWriter, r *http.
         return
     }
 
+    log.Printf("server power action uuid=%s action=%s state=%s", uuid, req.Action, record.State)
     w.WriteHeader(http.StatusNoContent)
 }
 
@@ -249,8 +258,30 @@ func handleGetResources(cfg *Config, uuid string, w http.ResponseWriter, r *http
     resp.Resources.NetworkTxBytes = 0
     resp.Resources.Uptime = 0
 
+    log.Printf("server resources requested uuid=%s state=%s", uuid, record.State)
     w.Header().Set("Content-Type", "application/json")
     _ = json.NewEncoder(w).Encode(resp)
+}
+
+func handleSendCommand(cfg *Config, uuid string, w http.ResponseWriter, r *http.Request) {
+    record, err := loadServerRecord(cfg, uuid)
+    if err != nil {
+        if errors.Is(err, os.ErrNotExist) {
+            http.Error(w, "server not found", http.StatusNotFound)
+            return
+        }
+        http.Error(w, fmt.Sprintf("failed to load server: %v", err), http.StatusInternalServerError)
+        return
+    }
+
+    var req commandRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, fmt.Sprintf("invalid command payload: %v", err), http.StatusBadRequest)
+        return
+    }
+
+    log.Printf("server command received uuid=%s state=%s command=%q", uuid, record.State, req.Command)
+    w.WriteHeader(http.StatusNoContent)
 }
 
 func handleDeleteServer(cfg *Config, uuid string, w http.ResponseWriter, r *http.Request) {
@@ -260,6 +291,7 @@ func handleDeleteServer(cfg *Config, uuid string, w http.ResponseWriter, r *http
         return
     }
     _ = os.Remove(serverRecordDir(cfg, uuid))
+    log.Printf("server deleted uuid=%s", uuid)
     w.WriteHeader(http.StatusNoContent)
 }
 
